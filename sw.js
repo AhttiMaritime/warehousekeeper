@@ -4,7 +4,7 @@
 // (those always go to the live Apps Script backend); it just caches the app
 // shell so the icon opens instantly.
 var CACHE_NAME = 'warehousekeeper-shell-v1';
-var SHELL_FILES = ['./index.html', './manifest.json', './icons/icon-192.png', './icons/icon-512.png'];
+var SHELL_FILES = ['./index.html', './manifest.json', './icon-192.png', './icon-512.png'];
 
 self.addEventListener('install', function(event){
   self.skipWaiting();
