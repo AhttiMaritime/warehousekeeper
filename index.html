@@ -567,13 +567,22 @@
       document.getElementById('act-export').onclick = exportReportCsv;
     } else if(currentView==='documents'){
       if(docEditor){
-        el.innerHTML = '<button class="btn btn-ghost btn-sm" id="act-doc-cancel">Cancel</button><button class="btn btn-primary" id="act-doc-save">Save</button>';
+        el.innerHTML = '<button class="btn btn-ghost btn-sm" id="act-doc-cancel">Cancel</button>'+
+          '<button class="btn btn-ghost btn-sm" id="act-doc-print">🖨 Print</button>'+
+          '<button class="btn btn-ghost btn-sm" id="act-doc-email">✉ Email</button>'+
+          '<button class="btn btn-primary" id="act-doc-save">Save</button>';
         document.getElementById('act-doc-cancel').onclick = function(){
           confirmDialog('Discard Changes','Unsaved changes will be lost. Discard them?','Discard').then(function(ok){
             if(!ok) return; docEditor=null; renderTopbarActions(); renderAll();
           });
         };
         document.getElementById('act-doc-save').onclick = saveDocEditor;
+        document.getElementById('act-doc-print').onclick = function(){
+          saveDocEditorAsync().then(function(res){ renderTopbarActions(); renderAll(); printDocument(res.id); });
+        };
+        document.getElementById('act-doc-email').onclick = function(){
+          saveDocEditorAsync().then(function(res){ var contact = docEditor.customerContact; renderTopbarActions(); renderAll(); openEmailModal(res.id, contact); });
+        };
       } else {
         el.innerHTML = '<button class="btn btn-ghost btn-sm" id="act-new-quote">+ New Quote</button><button class="btn btn-primary" id="act-new-invoice">+ New Invoice</button>';
         document.getElementById('act-new-quote').onclick = function(){ openDocEditor('quote'); };
@@ -1145,7 +1154,7 @@
       if(currentView==='documents') renderAll();
     });
   }
-  function blankDocRow(){ return { itemId:'', sku:'', name:'', unit:'', qty:1, unitPrice:0 }; }
+  function blankDocRow(){ return { itemId:'', sku:'', name:'', nameEn:'', unit:'', qty:1, unitPrice:0 }; }
   function todayStr(){ var d=new Date(); return d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0')+'-'+String(d.getDate()).padStart(2,'0'); }
   function computeDocTotals(d){
     var subtotal = d.rows.reduce(function(s,r){ return s+(Number(r.qty)||0)*(Number(r.unitPrice)||0); },0);
@@ -1160,14 +1169,14 @@
         docEditor = {
           id:h.id, type:h.type, docNo:h.docNo, customerName:h.customerName, customerAddr:h.customerAddr,
           customerContact:h.customerContact, issueDate:(h.issueDate||'').slice(0,10) || todayStr(), dueDate:(h.dueDate||'').slice(0,10),
-          notes:h.notes, applyGst: Number(h.gstRate)>0, gstRate: Number(h.gstRate) || Number(settings.gstRate||9), createdAt:h.createdAt,
-          rows: (data.items||[]).map(function(li){ return {itemId:li.itemId, sku:li.sku, name:li.name, unit:li.unit, qty:Number(li.qty), unitPrice:Number(li.unitPrice)}; })
+          paymentTerms:h.paymentTerms||'', notes:h.notes, applyGst: Number(h.gstRate)>0, gstRate: Number(h.gstRate) || Number(settings.gstRate||9), createdAt:h.createdAt,
+          rows: (data.items||[]).map(function(li){ return {itemId:li.itemId, sku:li.sku, name:li.name, nameEn:li.nameEn||'', unit:li.unit, qty:Number(li.qty), unitPrice:Number(li.unitPrice)}; })
         };
         if(docEditor.rows.length===0) docEditor.rows.push(blankDocRow());
         renderTopbarActions(); renderAll();
       });
     } else {
-      docEditor = { id:null, type:type, docNo:'', customerName:'', customerAddr:'', customerContact:'', issueDate: todayStr(), dueDate:'', notes:'', applyGst:true, gstRate:Number(settings.gstRate||9), rows:[blankDocRow()] };
+      docEditor = { id:null, type:type, docNo:'', customerName:'', customerAddr:'', customerContact:'', issueDate: todayStr(), dueDate:'', paymentTerms:'', notes:'', applyGst:true, gstRate:Number(settings.gstRate||9), rows:[blankDocRow()] };
       renderTopbarActions(); renderAll();
     }
   }
@@ -1198,6 +1207,7 @@
           '<td style="white-space:nowrap;text-align:right;">'+
             '<button class="icon-btn" data-doc-edit="'+d.id+'" title="Edit">✎</button> '+
             '<button class="icon-btn" data-doc-print="'+d.id+'" title="Print">🖨</button> '+
+            '<button class="icon-btn" data-doc-email="'+d.id+'" title="Email">✉</button> '+
             '<button class="icon-btn" data-doc-del="'+d.id+'" title="Delete">✕</button>'+
           '</td></tr>';
       });
@@ -1209,6 +1219,10 @@
     el.querySelectorAll('[data-doc-type]').forEach(function(b){ b.onclick=function(){ docsFilter.type=b.dataset.docType; renderDocuments(); }; });
     el.querySelectorAll('[data-doc-edit]').forEach(function(b){ b.onclick=function(){ openDocEditor(null, b.dataset.docEdit); }; });
     el.querySelectorAll('[data-doc-print]').forEach(function(b){ b.onclick=function(){ printDocument(b.dataset.docPrint); }; });
+    el.querySelectorAll('[data-doc-email]').forEach(function(b){ b.onclick=function(){
+      var d = docsList.find(function(x){return x.id===b.dataset.docEmail;});
+      openEmailModal(b.dataset.docEmail, d ? d.customerContact : '');
+    }; });
     el.querySelectorAll('[data-doc-del]').forEach(function(b){ b.onclick=function(){
       var d = docsList.find(function(x){return x.id===b.dataset.docDel;});
       confirmDialog('Delete Document', 'This will delete '+(d?d.docNo:'')+'. This cannot be undone.', 'Delete', true).then(function(ok){
@@ -1220,7 +1234,11 @@
   function docRowHtml(r, idx){
     var amount = (Number(r.qty)||0)*(Number(r.unitPrice)||0);
     return '<div class="doc-row" data-row="'+idx+'">'+
-      '<div class="picker-wrap"><input type="text" class="search-input" style="width:100%" placeholder="Search item or type manually" data-field="name" value="'+esc(r.name)+'" autocomplete="off"><div class="picker-list" data-row-list hidden></div></div>'+
+      '<div class="picker-wrap">'+
+        '<input type="text" class="search-input" style="width:100%" placeholder="Search item or type manually (Korean name)" data-field="name" value="'+esc(r.name)+'" autocomplete="off">'+
+        '<input type="text" style="width:100%;margin-top:4px;font-size:12px;color:var(--ink-muted);" placeholder="English name (shown on the document)" data-field="nameEn" value="'+esc(r.nameEn||'')+'" autocomplete="off">'+
+        '<div class="picker-list" data-row-list hidden></div>'+
+      '</div>'+
       '<input type="text" class="mono" data-field="sku" placeholder="SKU" value="'+esc(r.sku)+'">'+
       '<input type="text" data-field="unit" placeholder="Unit" value="'+esc(r.unit)+'">'+
       '<input type="number" data-field="qty" placeholder="Qty" value="'+Number(r.qty)+'" min="0" step="1">'+
@@ -1244,6 +1262,7 @@
         '<label class="field">Issue Date<input type="text" id="d-issue" value="'+esc(d.issueDate)+'" placeholder="YYYY-MM-DD"></label>'+
         (isInvoice ? '<label class="field">Due Date (optional)<input type="text" id="d-due" value="'+esc(d.dueDate)+'" placeholder="YYYY-MM-DD"></label>' : '<div></div>')+
       '</div>'+
+      '<label class="field" style="margin-top:12px;">Payment Terms (optional)<input type="text" id="d-terms" value="'+esc(d.paymentTerms||'')+'" placeholder="e.g. Net 30 / COD / 50% Deposit"></label>'+
       '<label class="field" style="margin-top:12px;">Notes (optional)<textarea id="d-notes" rows="2">'+esc(d.notes)+'</textarea></label>'+
     '</div>';
 
@@ -1271,7 +1290,7 @@
 
     el.innerHTML = html;
 
-    var fieldMap = {'d-customer':'customerName','d-contact':'customerContact','d-addr':'customerAddr','d-issue':'issueDate','d-due':'dueDate','d-notes':'notes'};
+    var fieldMap = {'d-customer':'customerName','d-contact':'customerContact','d-addr':'customerAddr','d-issue':'issueDate','d-due':'dueDate','d-terms':'paymentTerms','d-notes':'notes'};
     Object.keys(fieldMap).forEach(function(id){
       var input = document.getElementById(id); if(!input) return;
       input.addEventListener('input', function(){ d[fieldMap[id]] = input.value; });
@@ -1306,9 +1325,10 @@
       }
       function pickRowItem(it){
         if(!it) return;
-        row.itemId = it.id; row.sku = it.sku; row.name = it.nameEn || it.name; row.unit = it.unit; row.unitPrice = Number(it.unitPrice)||0;
+        row.itemId = it.id; row.sku = it.sku; row.name = it.name; row.nameEn = it.nameEn || ''; row.unit = it.unit; row.unitPrice = Number(it.unitPrice)||0;
         listEl.hidden = true;
         rowEl.querySelector('[data-field="name"]').value = row.name;
+        rowEl.querySelector('[data-field="nameEn"]').value = row.nameEn;
         rowEl.querySelector('[data-field="sku"]').value = row.sku;
         rowEl.querySelector('[data-field="unit"]').value = row.unit;
         rowEl.querySelector('[data-field="unitPrice"]').value = row.unitPrice;
@@ -1330,6 +1350,7 @@
       });
       document.addEventListener('mousedown', function(e){ if(!rowEl.contains(e.target)) listEl.hidden = true; });
 
+      rowEl.querySelector('[data-field="nameEn"]').addEventListener('input', function(e){ row.nameEn = e.target.value; });
       rowEl.querySelector('[data-field="sku"]').addEventListener('input', function(e){ row.sku = e.target.value; });
       rowEl.querySelector('[data-field="unit"]').addEventListener('input', function(e){ row.unit = e.target.value; });
       rowEl.querySelector('[data-field="qty"]').addEventListener('input', function(e){ row.qty = Number(e.target.value)||0; updateRowAmount(rowEl, row); });
@@ -1350,22 +1371,61 @@
     if(gstEl) gstEl.textContent = fmtMoney(totals.gstAmount);
     if(totalEl) totalEl.textContent = fmtMoney(totals.total);
   }
-  function saveDocEditor(){
+  // Saves the current draft without leaving the editor - used by both the Print and
+  // Email buttons, since both need a saved doc (with a real doc number) to work from.
+  // Resolves with {id, docNo}; rejects (silently - the toast already explained why)
+  // when validation fails, so callers can just .then() and ignore the rejection.
+  function saveDocEditorAsync(){
     var d = docEditor;
     var validRows = d.rows.filter(function(r){ return r.name && r.name.trim() && Number(r.qty)>0; });
-    if(!d.customerName || !d.customerName.trim()){ toast('Please enter a customer name.','err'); return; }
-    if(validRows.length===0){ toast('Please add at least one item (name and quantity required).','err'); return; }
+    if(!d.customerName || !d.customerName.trim()){ toast('Please enter a customer name.','err'); return Promise.reject(); }
+    if(validRows.length===0){ toast('Please add at least one item (name and quantity required).','err'); return Promise.reject(); }
     var payload = {
       id: d.id, type: d.type, docNo: d.docNo, customerName: d.customerName.trim(), customerAddr: d.customerAddr,
-      customerContact: d.customerContact, issueDate: d.issueDate, dueDate: d.dueDate, notes: d.notes,
+      customerContact: d.customerContact, issueDate: d.issueDate, dueDate: d.dueDate, paymentTerms: d.paymentTerms||'', notes: d.notes,
       applyGst: d.applyGst, gstRate: d.gstRate, createdAt: d.createdAt, createdBy: lastName(),
-      items: validRows.map(function(r){ return { itemId:r.itemId, sku:r.sku, name:r.name, unit:r.unit, qty:r.qty, unitPrice:r.unitPrice }; })
+      items: validRows.map(function(r){ return { itemId:r.itemId, sku:r.sku, name:r.name, nameEn:r.nameEn||'', unit:r.unit, qty:r.qty, unitPrice:r.unitPrice }; })
     };
-    callServer('saveDocument', payload).then(function(res){
+    return callServer('saveDocument', payload).then(function(res){
+      d.id = res.id; d.docNo = res.docNo;
+      return res;
+    });
+  }
+  function saveDocEditor(){
+    saveDocEditorAsync().then(function(res){
       toast('Saved. ('+res.docNo+')','ok');
       docEditor = null;
       return loadDocuments();
-    }).then(function(){ renderTopbarActions(); });
+    }).then(function(){ renderTopbarActions(); }).catch(function(){});
+  }
+  function openEmailModal(docId, prefillContact){
+    var contact = prefillContact || '';
+    var looksLikeEmail = /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(contact.trim());
+    openModal(
+      '<h2>Email Document</h2><div style="display:flex;flex-direction:column;gap:12px;">'+
+        '<label class="field">To<input type="email" id="em-to" value="'+esc(looksLikeEmail?contact.trim():'')+'" placeholder="customer@example.com"></label>'+
+        '<label class="field">Cc (optional)<input type="email" id="em-cc" placeholder=""></label>'+
+        '<label class="field">Message (optional)<textarea id="em-msg" rows="3" placeholder="A short note to include above the document details"></textarea></label>'+
+        '<div class="field-error" id="em-err"></div>'+
+      '</div><div class="modal-foot"><button class="btn btn-ghost" id="em-cancel">Cancel</button><button class="btn btn-primary" id="em-send">Send</button></div>',
+      function(modal){
+        modal.querySelector('#em-cancel').onclick = closeModal;
+        modal.querySelector('#em-send').onclick = function(){
+          var to = modal.querySelector('#em-to').value.trim();
+          var cc = modal.querySelector('#em-cc').value.trim();
+          var msg = modal.querySelector('#em-msg').value.trim();
+          var err = modal.querySelector('#em-err'); err.textContent='';
+          if(!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(to)){ err.textContent='Please enter a valid email address.'; return; }
+          var btn = modal.querySelector('#em-send'); btn.disabled = true; btn.textContent = 'Sending...';
+          callServer('emailDocument', {id:docId, to:to, cc:cc, message:msg}).then(function(){
+            closeModal(); toast('Email sent to '+to+'.','ok');
+          }).catch(function(res){
+            btn.disabled = false; btn.textContent = 'Send';
+            err.textContent = (res && res.error) ? res.error : 'Failed to send email.';
+          });
+        };
+      }
+    );
   }
   function printDocument(id){
     callServer('getDocument', {id:id}).then(function(data){
@@ -1383,7 +1443,8 @@
     if(settings.companyContact) html += '<div>'+esc(settings.companyContact)+'</div>';
     if(settings.companyRegNo) html += '<div>Reg. No. '+esc(settings.companyRegNo)+'</div>';
     html += '</div><div class="doc-print-title"><h1>'+docTitle+'</h1><div class="meta"><div>Doc No.: '+esc(h.docNo)+'</div><div>Date: '+esc((h.issueDate||'').slice(0,10))+'</div>'+
-      (isInvoice && h.dueDate ? '<div>Due: '+esc((h.dueDate||'').slice(0,10))+'</div>':'')+'</div></div></div>';
+      (isInvoice && h.dueDate ? '<div>Due: '+esc((h.dueDate||'').slice(0,10))+'</div>':'')+
+      (h.paymentTerms ? '<div>Payment Terms: '+esc(h.paymentTerms)+'</div>':'')+'</div></div></div>';
 
     html += '<div class="doc-print-to"><div class="label">Bill To</div><div class="name">'+esc(h.customerName||'-')+'</div>';
     if(h.customerAddr) html += '<div>'+esc(h.customerAddr)+'</div>';
@@ -1392,7 +1453,8 @@
 
     html += '<table><thead><tr><th>No</th><th>Item</th><th>SKU</th><th>Unit</th><th class="num">Qty</th><th class="num">Unit Price</th><th class="num">Amount</th></tr></thead><tbody>';
     lineItems.forEach(function(li, idx){
-      html += '<tr><td>'+(idx+1)+'</td><td>'+esc(li.name)+'</td><td>'+esc(li.sku||'-')+'</td><td>'+esc(li.unit||'-')+'</td><td class="num">'+fmtNum(li.qty)+'</td><td class="num">'+fmtNum(li.unitPrice)+'</td><td class="num">'+fmtNum(li.amount)+'</td></tr>';
+      var nameCell = esc(li.name)+((li.nameEn && li.nameEn!==li.name) ? '<div style="font-size:11px;color:#777;">'+esc(li.nameEn)+'</div>' : '');
+      html += '<tr><td>'+(idx+1)+'</td><td>'+nameCell+'</td><td>'+esc(li.sku||'-')+'</td><td>'+esc(li.unit||'-')+'</td><td class="num">'+fmtNum(li.qty)+'</td><td class="num">'+fmtNum(li.unitPrice)+'</td><td class="num">'+fmtNum(li.amount)+'</td></tr>';
     });
     html += '</tbody></table>';
 
