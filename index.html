@@ -720,8 +720,11 @@
         modal.querySelector('#f-cancel').onclick = closeModal;
         if(isEdit){
           modal.querySelector('#f-archive').onclick = function(){
-            callServer('updateItem', {id:existing.id, patch:{archived: !existing.archived}}).then(function(){
-              closeModal(); toast(existing.archived?'Item restored.':'Item archived.','ok'); return refresh();
+            var wasArchived = existing.archived;
+            callServer('updateItem', {id:existing.id, patch:{archived: !wasArchived}}).then(function(){
+              existing.archived = !wasArchived;
+              closeModal(); toast(wasArchived?'Item restored.':'Item archived.','ok');
+              renderTopbarActions(); renderAll();
             });
           };
           modal.querySelector('#f-delete').onclick = function(){
@@ -729,7 +732,9 @@
             confirmDialog('Delete Item','Permanently delete "'+existing.name+'"? Its transaction history will be kept, but the item itself cannot be recovered. If you just want to hide it, use Archive instead.','Delete',true).then(function(ok){
               if(!ok) return;
               callServer('deleteItem', {id:existing.id}).then(function(){
-                toast('Item deleted.','ok'); return refresh();
+                var idx = items.findIndex(function(i){ return i.id===existing.id; });
+                if(idx>-1) items.splice(idx,1);
+                toast('Item deleted.','ok'); renderAll();
               });
             });
           };
@@ -755,16 +760,26 @@
           if(isNaN(stock)||stock<0){ errEl.textContent='Please check the stock quantity.'; return; }
 
           if(!isEdit){
-            callServer('addItem', {sku:sku,name:name,nameEn:nameEn,category:category,unit:unit,minStock:min,unitPrice:price,costPrice:cost,bondPrice:bond,supplier:supplier,packingDetail:packingDetail,memo:memo,currentStock:stock,by:lastName()}).then(function(){
-              closeModal(); toast('Item added.','ok'); return refresh();
+            callServer('addItem', {sku:sku,name:name,nameEn:nameEn,category:category,unit:unit,minStock:min,unitPrice:price,costPrice:cost,bondPrice:bond,supplier:supplier,packingDetail:packingDetail,memo:memo,currentStock:stock,by:lastName()}).then(function(newItem){
+              items.push(newItem);
+              closeModal(); toast('Item added.','ok');
+              renderTopbarActions(); renderAll();
             });
           } else {
             var diff = stock - Number(existing.currentStock||0);
-            callServer('updateItem', {id:existing.id, patch:{sku:sku,name:name,nameEn:nameEn,category:category,unit:unit,minStock:min,unitPrice:price,costPrice:cost,bondPrice:bond,supplier:supplier,packingDetail:packingDetail,memo:memo,currentStock:stock}}).then(function(){
+            // When stock changed, let addTransaction apply the delta (it adds to whatever is
+            // currently on the sheet) instead of also setting an absolute value here - otherwise
+            // the two calls would double-apply the change.
+            var patch = {sku:sku,name:name,nameEn:nameEn,category:category,unit:unit,minStock:min,unitPrice:price,costPrice:cost,bondPrice:bond,supplier:supplier,packingDetail:packingDetail,memo:memo};
+            if(diff===0) patch.currentStock = stock;
+            callServer('updateItem', {id:existing.id, patch:patch}).then(function(){
+              Object.assign(existing, patch);
               if(diff!==0){
-                return callServer('addTransaction', {itemId:existing.id, sku:sku, name:name, type: diff>0?'in':'out', qty:Math.abs(diff), note:'Stock adjustment', by:lastName(), source:'adjust'});
+                return callServer('addTransaction', {itemId:existing.id, sku:sku, name:name, type: diff>0?'in':'out', qty:Math.abs(diff), note:'Stock adjustment', by:lastName(), source:'adjust'}).then(function(){
+                  existing.currentStock = stock;
+                });
               }
-            }).then(function(){ closeModal(); toast('Item saved.','ok'); return refresh(); });
+            }).then(function(){ closeModal(); toast('Item saved.','ok'); renderTopbarActions(); renderAll(); });
           }
         };
       }
@@ -1066,10 +1081,13 @@
       if(!qty||qty<=0){ errEl.textContent='Please check the quantity.'; return; }
       if(pendingType==='out' && qty>Number(pendingItem.currentStock||0)){ errEl.textContent='Cannot remove more than current stock ('+fmtNum(pendingItem.currentStock)+esc(pendingItem.unit||'')+').'; return; }
       rememberName(by);
-      callServer('addTransaction', {itemId:pendingItem.id, sku:pendingItem.sku, name:pendingItem.name, type:pendingType, qty:qty, note:note, by:by, source:'manual'}).then(function(){
+      var itemRef = pendingItem;
+      callServer('addTransaction', {itemId:itemRef.id, sku:itemRef.sku, name:itemRef.name, type:pendingType, qty:qty, note:note, by:by, source:'manual'}).then(function(tx){
+        itemRef.currentStock = Number(itemRef.currentStock||0) + (pendingType==='in'?qty:-qty);
+        txs.unshift(tx);
         toast((pendingType==='in'?'Stock in':'Stock out')+' recorded.','ok');
         pendingItem = null;
-        return refresh();
+        renderTopbarActions(); renderAll();
       });
     };
   }
