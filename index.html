@@ -578,10 +578,11 @@
         };
         document.getElementById('act-doc-save').onclick = saveDocEditor;
         document.getElementById('act-doc-print').onclick = function(){
-          saveDocEditorAsync().then(function(res){ renderTopbarActions(); renderAll(); printDocument(res.id); });
+          printFromEditor();
+          saveDocEditorAsync().then(function(){ renderTopbarActions(); renderAll(); }).catch(function(){});
         };
         document.getElementById('act-doc-email').onclick = function(){
-          saveDocEditorAsync().then(function(res){ var contact = docEditor.customerContact; renderTopbarActions(); renderAll(); openEmailModal(res.id, contact); });
+          openEmailModal(docEditor.id, docEditor.customerContact, true);
         };
       } else {
         el.innerHTML = '<button class="btn btn-ghost btn-sm" id="act-new-quote">+ New Quote</button><button class="btn btn-primary" id="act-new-invoice">+ New Invoice</button>';
@@ -686,11 +687,11 @@
     var categories = Array.from(new Set(items.map(function(i){return i.category;}).filter(Boolean)));
     openModal(
       '<h2>'+(isEdit?'Edit Item':'Add Item')+'</h2><div style="display:flex;flex-direction:column;gap:12px;">'+
+        '<label class="field">SKU<input type="text" id="f-sku" class="mono" value="'+esc(isEdit?existing.sku:'')+'" placeholder="e.g. BOX-L"></label>'+
         '<div class="form-grid">'+
-          '<label class="field">SKU<input type="text" id="f-sku" class="mono" value="'+esc(isEdit?existing.sku:'')+'" placeholder="e.g. BOX-L"></label>'+
-          '<label class="field">Item Name<input type="text" id="f-name" value="'+esc(isEdit?existing.name:'')+'" placeholder="e.g. Cardboard Box (Large)"></label>'+
+          '<label class="field">Item Name (Korean)<input type="text" id="f-name" value="'+esc(isEdit?existing.name:'')+'" placeholder="e.g. 골판지 박스 (대)"></label>'+
+          '<label class="field">English Name (Quotes &amp; Invoices, optional)<input type="text" id="f-name-en" value="'+esc(isEdit?(existing.nameEn||''):'')+'" placeholder="Leave blank to reuse Item Name"></label>'+
         '</div>'+
-        '<label class="field">English Name (used on Quotes &amp; Invoices, optional)<input type="text" id="f-name-en" value="'+esc(isEdit?(existing.nameEn||''):'')+'" placeholder="Leave blank to reuse Item Name"></label>'+
         '<div class="form-grid">'+
           '<label class="field">Category<input type="text" id="f-category" list="cat-list" value="'+esc(isEdit?existing.category:'')+'" placeholder="e.g. Packaging"></label>'+
           '<label class="field">Unit<input type="text" id="f-unit" value="'+esc(isEdit?existing.unit:'pcs')+'" placeholder="pcs / box / kg"></label>'+
@@ -1235,8 +1236,10 @@
     var amount = (Number(r.qty)||0)*(Number(r.unitPrice)||0);
     return '<div class="doc-row" data-row="'+idx+'">'+
       '<div class="picker-wrap">'+
-        '<input type="text" class="search-input" style="width:100%" placeholder="Search item or type manually (Korean name)" data-field="name" value="'+esc(r.name)+'" autocomplete="off">'+
-        '<input type="text" style="width:100%;margin-top:4px;font-size:12px;color:var(--ink-muted);" placeholder="English name (shown on the document)" data-field="nameEn" value="'+esc(r.nameEn||'')+'" autocomplete="off">'+
+        '<div style="display:flex;gap:6px;flex-wrap:wrap;">'+
+          '<input type="text" class="search-input" style="flex:1 1 140px;min-width:0;" placeholder="Search item or type manually (Korean name)" data-field="name" value="'+esc(r.name)+'" autocomplete="off">'+
+          '<input type="text" style="flex:1 1 120px;min-width:0;font-size:12px;color:var(--ink-muted);" placeholder="English name" data-field="nameEn" value="'+esc(r.nameEn||'')+'" autocomplete="off">'+
+        '</div>'+
         '<div class="picker-list" data-row-list hidden></div>'+
       '</div>'+
       '<input type="text" class="mono" data-field="sku" placeholder="SKU" value="'+esc(r.sku)+'">'+
@@ -1398,7 +1401,7 @@
       return loadDocuments();
     }).then(function(){ renderTopbarActions(); }).catch(function(){});
   }
-  function openEmailModal(docId, prefillContact){
+  function openEmailModal(docId, prefillContact, needsSave){
     var contact = prefillContact || '';
     var looksLikeEmail = /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(contact.trim());
     openModal(
@@ -1417,7 +1420,12 @@
           var err = modal.querySelector('#em-err'); err.textContent='';
           if(!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(to)){ err.textContent='Please enter a valid email address.'; return; }
           var btn = modal.querySelector('#em-send'); btn.disabled = true; btn.textContent = 'Sending...';
-          callServer('emailDocument', {id:docId, to:to, cc:cc, message:msg}).then(function(){
+          var idPromise = needsSave
+            ? saveDocEditorAsync().then(function(res){ renderTopbarActions(); renderAll(); return res.id; })
+            : Promise.resolve(docId);
+          idPromise.then(function(idToUse){
+            return callServer('emailDocument', {id:idToUse, to:to, cc:cc, message:msg});
+          }).then(function(){
             closeModal(); toast('Email sent to '+to+'.','ok');
           }).catch(function(res){
             btn.disabled = false; btn.textContent = 'Send';
@@ -1433,6 +1441,26 @@
       setTimeout(function(){ window.print(); }, 50);
     });
   }
+  function buildLocalDocPrintData(){
+    var d = docEditor;
+    var validRows = d.rows.filter(function(r){ return r.name && r.name.trim() && Number(r.qty)>0; });
+    var totals = computeDocTotals({ rows: validRows, applyGst: d.applyGst, gstRate: d.gstRate });
+    var header = {
+      type: d.type, docNo: d.docNo || '', issueDate: d.issueDate, dueDate: d.dueDate, paymentTerms: d.paymentTerms,
+      customerName: d.customerName, customerAddr: d.customerAddr, customerContact: d.customerContact,
+      currency: settings.currency, subtotal: totals.subtotal, gstRate: d.applyGst ? (Number(d.gstRate)||0) : 0,
+      gstAmount: totals.gstAmount, total: totals.total, notes: d.notes
+    };
+    var lineItems = validRows.map(function(r){
+      return { name:r.name, nameEn:r.nameEn||'', sku:r.sku, unit:r.unit, qty:Number(r.qty)||0, unitPrice:Number(r.unitPrice)||0, amount:(Number(r.qty)||0)*(Number(r.unitPrice)||0) };
+    });
+    return { header: header, items: lineItems };
+  }
+  function printFromEditor(){
+    var data = buildLocalDocPrintData();
+    renderPrintArea(data.header, data.items);
+    setTimeout(function(){ window.print(); }, 50);
+  }
   function renderPrintArea(h, lineItems){
     var isInvoice = h.type==='invoice';
     var docTitle = isInvoice ? 'INVOICE' : 'QUOTATION';
@@ -1442,7 +1470,7 @@
     if(settings.companyAddr) html += '<div>'+esc(settings.companyAddr)+'</div>';
     if(settings.companyContact) html += '<div>'+esc(settings.companyContact)+'</div>';
     if(settings.companyRegNo) html += '<div>Reg. No. '+esc(settings.companyRegNo)+'</div>';
-    html += '</div><div class="doc-print-title"><h1>'+docTitle+'</h1><div class="meta"><div>Doc No.: '+esc(h.docNo)+'</div><div>Date: '+esc((h.issueDate||'').slice(0,10))+'</div>'+
+    html += '</div><div class="doc-print-title"><h1>'+docTitle+'</h1><div class="meta"><div>Doc No.: '+esc(h.docNo||'DRAFT')+'</div><div>Date: '+esc((h.issueDate||'').slice(0,10))+'</div>'+
       (isInvoice && h.dueDate ? '<div>Due: '+esc((h.dueDate||'').slice(0,10))+'</div>':'')+
       (h.paymentTerms ? '<div>Payment Terms: '+esc(h.paymentTerms)+'</div>':'')+'</div></div></div>';
 
@@ -1482,9 +1510,9 @@
 })();
 </script>
 <script>
-if('serviceWorker' in navigator){
-  window.addEventListener('load', function(){
-    navigator.serviceWorker.register('sw.js').catch(function(){});
+if ("serviceWorker" in navigator) {
+  window.addEventListener("load", function(){
+    navigator.serviceWorker.register("sw.js").catch(function(e){ console.warn("SW registration failed", e); });
   });
 }
 </script>
