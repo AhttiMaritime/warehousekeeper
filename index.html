@@ -355,7 +355,13 @@
   /* ---------------- utils ---------------- */
   function esc(s){ return String(s==null?"":s).replace(/[&<>"']/g, function(c){ return {"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]; }); }
   function fmtNum(n){ n = Number(n)||0; return n.toLocaleString('en-US', {maximumFractionDigits:2}); }
-  function fmtMoney(n){ return (settings.currency||'') + fmtNum(n); }
+  // Money amounts always show exactly 2 decimal places (1.9 -> "1.90"), unlike fmtNum which is
+  // also used for plain quantities and should not grow trailing zeros there.
+  function fmtAmt(n){ n = Number(n)||0; return n.toLocaleString('en-US', {minimumFractionDigits:2, maximumFractionDigits:2}); }
+  function fmtMoney(n){ return (settings.currency||'') + fmtAmt(n); }
+  // Rounds a price/amount to 2 decimal places to avoid binary floating-point artifacts
+  // (e.g. 6.4 stored as 6.3999999999999995) leaking into stored data or input fields.
+  function round2(n){ n = Number(n); if(!isFinite(n)) return 0; return Math.round(n*100)/100; }
   function fmtDate(iso){ if(!iso) return '-'; var d=new Date(iso); if(isNaN(d)) return '-'; return d.toLocaleString('en-GB',{year:'2-digit',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit'}); }
   function fmtDay(iso){ var d=new Date(iso); return (d.getMonth()+1)+'/'+d.getDate(); }
   function dayKey(iso){ var d=new Date(iso); return d.getFullYear()+'-'+(d.getMonth()+1)+'-'+d.getDate(); }
@@ -543,6 +549,7 @@
       el.innerHTML = '<input type="file" id="import-file-input" accept=".xlsx,.xls,.csv" style="display:none">'+
         '<button class="btn btn-ghost btn-sm" id="act-import">Import from Excel</button>'+
         '<button class="btn btn-ghost btn-sm" id="act-fix-names">Split Combined Names</button>'+
+        '<button class="btn btn-ghost btn-sm" id="act-fix-prices">Fix Price Rounding</button>'+
         '<button class="btn btn-ghost btn-sm" id="act-recalc-all">Recalculate All</button>'+
         '<button class="btn btn-primary" id="act-add-item">+ Add Item</button>';
       document.getElementById('act-add-item').onclick = function(){ openItemModal(null); };
@@ -557,8 +564,15 @@
       });
       document.getElementById('act-fix-names').onclick = function(){
         callServer('fixMergedNames', {}).then(function(res){
-          var d = (res && res.data) || {};
+          var d = res || {};
           toast('Fixed '+(d.fixed||0)+' of '+(d.checked||0)+' items with combined Korean/English names.','ok');
+          return refresh();
+        });
+      };
+      document.getElementById('act-fix-prices').onclick = function(){
+        callServer('fixPriceRounding', {}).then(function(res){
+          var d = res || {};
+          toast('Rounded prices on '+(d.fixed||0)+' of '+(d.checked||0)+' items.','ok');
           return refresh();
         });
       };
@@ -567,9 +581,13 @@
       document.getElementById('act-export').onclick = exportReportCsv;
     } else if(currentView==='documents'){
       if(docEditor){
+        var orderBtn = docEditor.type==='invoice'
+          ? (docEditor.orderedAt ? '<button class="btn btn-ghost btn-sm" disabled>📦 Ordered</button>' : '<button class="btn btn-ghost btn-sm" id="act-doc-order">📦 Order</button>')
+          : '';
         el.innerHTML = '<button class="btn btn-ghost btn-sm" id="act-doc-cancel">Cancel</button>'+
           '<button class="btn btn-ghost btn-sm" id="act-doc-print">🖨 Print</button>'+
           '<button class="btn btn-ghost btn-sm" id="act-doc-email">✉ Email</button>'+
+          orderBtn+
           '<button class="btn btn-primary" id="act-doc-save">Save</button>';
         document.getElementById('act-doc-cancel').onclick = function(){
           confirmDialog('Discard Changes','Unsaved changes will be lost. Discard them?','Discard').then(function(ok){
@@ -584,6 +602,28 @@
         document.getElementById('act-doc-email').onclick = function(){
           openEmailModal(docEditor.id, docEditor.customerContact, true);
         };
+        if(document.getElementById('act-doc-order')){
+          document.getElementById('act-doc-order').onclick = function(){
+            var linkedRows = docEditor.rows.filter(function(r){ return r.itemId && Number(r.qty)>0; });
+            if(linkedRows.length===0){ toast('No inventory-linked items on this invoice to deduct.','err'); return; }
+            confirmDialog('Place Order','This will deduct the ordered quantities from warehouse stock ('+linkedRows.length+' item(s)). This cannot be undone from here — you would need to manually stock the items back in. Continue?','Order',true).then(function(ok){
+              if(!ok) return;
+              saveDocEditorAsync().then(function(res){
+                return callServer('orderDocument', {id:res.id, by:lastName()});
+              }).then(function(){
+                linkedRows.forEach(function(r){
+                  var it = items.find(function(x){ return x.id===r.itemId; });
+                  if(it) it.currentStock = Number(it.currentStock||0) - Number(r.qty);
+                });
+                docEditor.orderedAt = new Date().toISOString();
+                toast('Order placed. Stock updated.','ok');
+                renderTopbarActions(); renderAll();
+              }).catch(function(err){
+                toast((err && err.error) ? err.error : 'Failed to place order.','err');
+              });
+            });
+          };
+        }
       } else {
         el.innerHTML = '<button class="btn btn-ghost btn-sm" id="act-new-quote">+ New Quote</button><button class="btn btn-primary" id="act-new-invoice">+ New Invoice</button>';
         document.getElementById('act-new-quote').onclick = function(){ openDocEditor('quote'); };
@@ -701,10 +741,10 @@
           (isEdit ? '<label class="field">Current Stock<input type="number" id="f-stock" value="'+Number(existing.currentStock||0)+'" step="1"></label>' : '<label class="field">Initial Stock<input type="number" id="f-stock" value="0" step="1"></label>')+
           '<label class="field">Min Stock (alert threshold)<input type="number" id="f-min" value="'+(isEdit?Number(existing.minStock||0):0)+'" step="1"></label>'+
         '</div>'+
-        '<label class="field">Unit Price / Sell Price (optional)<input type="number" id="f-price" value="'+(isEdit?Number(existing.unitPrice||0):0)+'" step="0.01"></label>'+
+        '<label class="field">Unit Price / Sell Price (optional)<input type="number" id="f-price" value="'+(isEdit?round2(existing.unitPrice||0):0)+'" step="0.01"></label>'+
         '<div class="form-grid">'+
-          '<label class="field">Cost Price (optional)<input type="number" id="f-cost" value="'+(isEdit?Number(existing.costPrice||0):0)+'" step="0.01"></label>'+
-          '<label class="field">Bond &amp; Individual Price (optional)<input type="number" id="f-bond" value="'+(isEdit?Number(existing.bondPrice||0):0)+'" step="0.01"></label>'+
+          '<label class="field">Cost Price (optional)<input type="number" id="f-cost" value="'+(isEdit?round2(existing.costPrice||0):0)+'" step="0.01"></label>'+
+          '<label class="field">Bond &amp; Individual Price (optional)<input type="number" id="f-bond" value="'+(isEdit?round2(existing.bondPrice||0):0)+'" step="0.01"></label>'+
         '</div>'+
         '<div class="form-grid">'+
           '<label class="field">Supplier (optional)<input type="text" id="f-supplier" value="'+esc(isEdit?(existing.supplier||''):'')+'" placeholder="e.g. KR / AHTTI / ALL"></label>'+
@@ -747,9 +787,9 @@
           var unit = modal.querySelector('#f-unit').value.trim() || 'pcs';
           var stock = Number(modal.querySelector('#f-stock').value);
           var min = Number(modal.querySelector('#f-min').value) || 0;
-          var price = Number(modal.querySelector('#f-price').value) || 0;
-          var cost = Number(modal.querySelector('#f-cost').value) || 0;
-          var bond = Number(modal.querySelector('#f-bond').value) || 0;
+          var price = round2(modal.querySelector('#f-price').value);
+          var cost = round2(modal.querySelector('#f-cost').value);
+          var bond = round2(modal.querySelector('#f-bond').value);
           var supplier = modal.querySelector('#f-supplier').value.trim();
           var packingDetail = modal.querySelector('#f-packing').value.trim();
           var memo = modal.querySelector('#f-memo').value.trim();
@@ -1176,10 +1216,10 @@
   function blankDocRow(){ return { itemId:'', sku:'', name:'', nameEn:'', unit:'', qty:1, unitPrice:0 }; }
   function todayStr(){ var d=new Date(); return d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0')+'-'+String(d.getDate()).padStart(2,'0'); }
   function computeDocTotals(d){
-    var subtotal = d.rows.reduce(function(s,r){ return s+(Number(r.qty)||0)*(Number(r.unitPrice)||0); },0);
+    var subtotal = round2(d.rows.reduce(function(s,r){ return s+(Number(r.qty)||0)*(Number(r.unitPrice)||0); },0));
     var gstRate = d.applyGst ? (Number(d.gstRate)||0) : 0;
     var gstAmount = Math.round(subtotal*gstRate)/100;
-    return { subtotal:subtotal, gstAmount:gstAmount, total:subtotal+gstAmount };
+    return { subtotal:subtotal, gstAmount:gstAmount, total:round2(subtotal+gstAmount) };
   }
   function openDocEditor(type, existingId){
     if(existingId){
@@ -1189,13 +1229,14 @@
           id:h.id, type:h.type, docNo:h.docNo, customerName:h.customerName, customerAddr:h.customerAddr,
           customerContact:h.customerContact, issueDate:(h.issueDate||'').slice(0,10) || todayStr(), dueDate:(h.dueDate||'').slice(0,10),
           paymentTerms:h.paymentTerms||'', notes:h.notes, applyGst: Number(h.gstRate)>0, gstRate: Number(h.gstRate) || Number(settings.gstRate||9), createdAt:h.createdAt,
-          rows: (data.items||[]).map(function(li){ return {itemId:li.itemId, sku:li.sku, name:li.name, nameEn:li.nameEn||'', unit:li.unit, qty:Number(li.qty), unitPrice:Number(li.unitPrice)}; })
+          orderedAt: h.orderedAt||'',
+          rows: (data.items||[]).map(function(li){ return {itemId:li.itemId, sku:li.sku, name:li.name, nameEn:li.nameEn||'', unit:li.unit, qty:Number(li.qty), unitPrice:round2(li.unitPrice)}; })
         };
         if(docEditor.rows.length===0) docEditor.rows.push(blankDocRow());
         renderTopbarActions(); renderAll();
       });
     } else {
-      docEditor = { id:null, type:type, docNo:'', customerName:'', customerAddr:'', customerContact:'', issueDate: todayStr(), dueDate:'', paymentTerms:'', notes:'', applyGst:true, gstRate:Number(settings.gstRate||9), rows:[blankDocRow()] };
+      docEditor = { id:null, type:type, docNo:'', customerName:'', customerAddr:'', customerContact:'', issueDate: todayStr(), dueDate:'', paymentTerms:'', notes:'', applyGst:true, gstRate:Number(settings.gstRate||9), orderedAt:'', rows:[blankDocRow()] };
       renderTopbarActions(); renderAll();
     }
   }
@@ -1218,11 +1259,11 @@
     else if(list.length===0){ html += '<tr class="empty-row"><td colspan="6">No documents yet. Use the buttons above to create one.</td></tr>'; }
     else {
       list.forEach(function(d){
-        html += '<tr><td class="mono cell-primary">'+esc(d.docNo)+'</td>'+
+        html += '<tr><td class="mono cell-primary">'+esc(d.docNo)+(d.orderedAt?' <span class="pill pill-good" style="font-size:10px;">Ordered</span>':'')+'</td>'+
           '<td>'+(d.type==='invoice'?'<span class="pill pill-good"><span class="dot"></span>Invoice</span>':'<span class="pill pill-muted"><span class="dot"></span>Quote</span>')+'</td>'+
           '<td>'+esc(d.customerName||'-')+'</td>'+
           '<td style="color:var(--ink-muted);font-size:12.5px;">'+esc((d.issueDate||'').slice(0,10))+'</td>'+
-          '<td class="num">'+esc(d.currency||'')+fmtNum(d.total)+'</td>'+
+          '<td class="num">'+esc(d.currency||'')+fmtAmt(d.total)+'</td>'+
           '<td style="white-space:nowrap;text-align:right;">'+
             '<button class="icon-btn" data-doc-edit="'+d.id+'" title="Edit">✎</button> '+
             '<button class="icon-btn" data-doc-print="'+d.id+'" title="Print">🖨</button> '+
@@ -1251,7 +1292,7 @@
     }; });
   }
   function docRowHtml(r, idx){
-    var amount = (Number(r.qty)||0)*(Number(r.unitPrice)||0);
+    var amount = round2((Number(r.qty)||0)*(Number(r.unitPrice)||0));
     return '<div class="doc-row" data-row="'+idx+'">'+
       '<div class="picker-wrap">'+
         '<div style="display:flex;gap:6px;flex-wrap:wrap;">'+
@@ -1263,8 +1304,8 @@
       '<input type="text" class="mono" data-field="sku" placeholder="SKU" value="'+esc(r.sku)+'">'+
       '<input type="text" data-field="unit" placeholder="Unit" value="'+esc(r.unit)+'">'+
       '<input type="number" data-field="qty" placeholder="Qty" value="'+Number(r.qty)+'" min="0" step="1">'+
-      '<input type="number" data-field="unitPrice" placeholder="Price" value="'+Number(r.unitPrice)+'" min="0" step="0.01">'+
-      '<div class="mono" data-amount style="text-align:right;font-size:13px;color:var(--ink-2);">'+fmtNum(amount)+'</div>'+
+      '<input type="number" data-field="unitPrice" placeholder="Price" value="'+round2(r.unitPrice)+'" min="0" step="0.01">'+
+      '<div class="mono" data-amount style="text-align:right;font-size:13px;color:var(--ink-2);">'+fmtAmt(amount)+'</div>'+
       '<button class="icon-btn" data-remove-row title="Delete">✕</button>'+
     '</div>';
   }
@@ -1272,7 +1313,8 @@
     var d = docEditor;
     var isInvoice = d.type==='invoice';
     var html = '<div class="card" style="margin-bottom:16px;">'+
-      '<div class="card-head"><div><div class="card-title">'+(d.id?(isInvoice?'Edit Invoice':'Edit Quote'):(isInvoice?'New Invoice':'New Quote'))+'</div>'+
+      '<div class="card-head"><div><div class="card-title">'+(d.id?(isInvoice?'Edit Invoice':'Edit Quote'):(isInvoice?'New Invoice':'New Quote'))+
+      (d.orderedAt?' <span class="pill pill-good" style="margin-left:6px;">Ordered · stock deducted</span>':'')+'</div>'+
       (d.docNo?'<div class="card-sub mono">'+esc(d.docNo)+'</div>':'<div class="card-sub">A document number will be assigned when saved</div>')+'</div></div>'+
       '<div class="form-grid">'+
         '<label class="field">Customer Name<input type="text" id="d-customer" value="'+esc(d.customerName)+'" placeholder="e.g. ABC Trading Pte Ltd"></label>'+
@@ -1339,14 +1381,14 @@
         rowHl = rowMatches.length ? 0 : -1;
         listEl.innerHTML = rowMatches.map(function(i){
           var enSub = (i.nameEn && i.nameEn!==i.name) ? (esc(i.nameEn)+' · ') : '';
-          return '<div class="picker-item" data-pick-id="'+i.id+'"><div class="cell-primary">'+esc(i.name)+'</div><div class="cell-sub mono">'+enSub+esc(i.sku)+' · Price '+fmtNum(i.unitPrice||0)+'</div></div>';
+          return '<div class="picker-item" data-pick-id="'+i.id+'"><div class="cell-primary">'+esc(i.name)+'</div><div class="cell-sub mono">'+enSub+esc(i.sku)+' · Price '+fmtAmt(i.unitPrice||0)+'</div></div>';
         }).join('');
         listEl.hidden = rowMatches.length===0;
         paintRowHighlight();
       }
       function pickRowItem(it){
         if(!it) return;
-        row.itemId = it.id; row.sku = it.sku; row.name = it.name; row.nameEn = it.nameEn || ''; row.unit = it.unit; row.unitPrice = Number(it.unitPrice)||0;
+        row.itemId = it.id; row.sku = it.sku; row.name = it.name; row.nameEn = it.nameEn || ''; row.unit = it.unit; row.unitPrice = round2(it.unitPrice);
         listEl.hidden = true;
         rowEl.querySelector('[data-field="name"]').value = row.name;
         rowEl.querySelector('[data-field="nameEn"]').value = row.nameEn;
@@ -1375,7 +1417,7 @@
       rowEl.querySelector('[data-field="sku"]').addEventListener('input', function(e){ row.sku = e.target.value; });
       rowEl.querySelector('[data-field="unit"]').addEventListener('input', function(e){ row.unit = e.target.value; });
       rowEl.querySelector('[data-field="qty"]').addEventListener('input', function(e){ row.qty = Number(e.target.value)||0; updateRowAmount(rowEl, row); });
-      rowEl.querySelector('[data-field="unitPrice"]').addEventListener('input', function(e){ row.unitPrice = Number(e.target.value)||0; updateRowAmount(rowEl, row); });
+      rowEl.querySelector('[data-field="unitPrice"]').addEventListener('input', function(e){ row.unitPrice = round2(e.target.value); updateRowAmount(rowEl, row); });
       rowEl.querySelector('[data-remove-row]').addEventListener('click', function(){
         docEditor.rows.splice(idx,1);
         if(docEditor.rows.length===0) docEditor.rows.push(blankDocRow());
@@ -1384,8 +1426,8 @@
     });
   }
   function updateRowAmount(rowEl, row){
-    var amt = (Number(row.qty)||0)*(Number(row.unitPrice)||0);
-    var amtEl = rowEl.querySelector('[data-amount]'); if(amtEl) amtEl.textContent = fmtNum(amt);
+    var amt = round2((Number(row.qty)||0)*(Number(row.unitPrice)||0));
+    var amtEl = rowEl.querySelector('[data-amount]'); if(amtEl) amtEl.textContent = fmtAmt(amt);
     var totals = computeDocTotals(docEditor);
     var subEl = document.getElementById('d-total-subtotal'), gstEl = document.getElementById('d-total-gst'), totalEl = document.getElementById('d-total-grand');
     if(subEl) subEl.textContent = fmtMoney(totals.subtotal);
@@ -1470,7 +1512,7 @@
       gstAmount: totals.gstAmount, total: totals.total, notes: d.notes
     };
     var lineItems = validRows.map(function(r){
-      return { name:r.name, nameEn:r.nameEn||'', sku:r.sku, unit:r.unit, qty:Number(r.qty)||0, unitPrice:Number(r.unitPrice)||0, amount:(Number(r.qty)||0)*(Number(r.unitPrice)||0) };
+      return { name:r.name, nameEn:r.nameEn||'', sku:r.sku, unit:r.unit, qty:Number(r.qty)||0, unitPrice:round2(r.unitPrice), amount:round2((Number(r.qty)||0)*(Number(r.unitPrice)||0)) };
     });
     return { header: header, items: lineItems };
   }
@@ -1500,14 +1542,14 @@
     html += '<table><thead><tr><th>No</th><th>Item</th><th>SKU</th><th>Unit</th><th class="num">Qty</th><th class="num">Unit Price</th><th class="num">Amount</th></tr></thead><tbody>';
     lineItems.forEach(function(li, idx){
       var nameCell = esc(li.name)+((li.nameEn && li.nameEn!==li.name) ? '<div style="font-size:11px;color:#777;">'+esc(li.nameEn)+'</div>' : '');
-      html += '<tr><td>'+(idx+1)+'</td><td>'+nameCell+'</td><td>'+esc(li.sku||'-')+'</td><td>'+esc(li.unit||'-')+'</td><td class="num">'+fmtNum(li.qty)+'</td><td class="num">'+fmtNum(li.unitPrice)+'</td><td class="num">'+fmtNum(li.amount)+'</td></tr>';
+      html += '<tr><td>'+(idx+1)+'</td><td>'+nameCell+'</td><td>'+esc(li.sku||'-')+'</td><td>'+esc(li.unit||'-')+'</td><td class="num">'+fmtNum(li.qty)+'</td><td class="num">'+fmtAmt(li.unitPrice)+'</td><td class="num">'+fmtAmt(li.amount)+'</td></tr>';
     });
     html += '</tbody></table>';
 
     html += '<div class="totals">'+
-      '<div><span>Subtotal</span><span>'+esc(h.currency||'')+fmtNum(h.subtotal)+'</span></div>'+
-      '<div><span>GST('+fmtNum(h.gstRate)+'%)</span><span>'+esc(h.currency||'')+fmtNum(h.gstAmount)+'</span></div>'+
-      '<div class="grand"><span>Total</span><span>'+esc(h.currency||'')+fmtNum(h.total)+'</span></div>'+
+      '<div><span>Subtotal</span><span>'+esc(h.currency||'')+fmtAmt(h.subtotal)+'</span></div>'+
+      '<div><span>GST('+fmtNum(h.gstRate)+'%)</span><span>'+esc(h.currency||'')+fmtAmt(h.gstAmount)+'</span></div>'+
+      '<div class="grand"><span>Total</span><span>'+esc(h.currency||'')+fmtAmt(h.total)+'</span></div>'+
     '</div>';
 
     if(h.notes) html += '<div class="notes">'+esc(h.notes).replace(/\n/g,'<br>')+'</div>';
